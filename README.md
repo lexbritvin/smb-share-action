@@ -76,3 +76,9 @@ jobs:
 ## License
 
 This project is licensed under the terms of the [LICENSE](./LICENSE) file included in this repository.
+
+---
+
+**⭐ Star this repo if you find it useful!**
+
+Made with ❤️ for the GitHub Actions community
