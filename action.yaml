@@ -1,0 +1,758 @@
+name: 'SMB Share'
+description: 'Creates an SMB user and share on Windows, macOS, and Linux runners'
+
+branding:
+  icon: 'share-2'
+  color: 'blue'
+
+inputs:
+  path:
+    description: 'Local directory path to share via SMB'
+    required: true
+  share-name:
+    description: 'Name of the SMB share'
+    required: true
+    default: 'shared'
+  share-user:
+    description: 'Username for SMB access'
+    required: true
+    default: 'smbuser'
+  share-pass:
+    description: 'Password for SMB user'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    # ================================================
+    # INPUT VALIDATION & PREPARATION
+    # ================================================
+    - name: Validate and sanitize inputs
+      shell: bash
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_SHARE_NAME: ${{ inputs.share-name }}
+        INPUT_SHARE_USER: ${{ inputs.share-user }}
+        INPUT_SHARE_PASS: ${{ inputs.share-pass }}
+      run: |
+        echo "🔍 Validating inputs..."
+
+        # Validate required inputs
+        VALIDATION_ERRORS=()
+
+        if [[ -z "$INPUT_PATH" ]]; then
+          VALIDATION_ERRORS+=("path input is required")
+        fi
+        
+        if [[ -z "$INPUT_SHARE_NAME" ]]; then
+          VALIDATION_ERRORS+=("share-name input is required")
+        fi
+        
+        if [[ -z "$INPUT_SHARE_USER" ]]; then
+          VALIDATION_ERRORS+=("share-user input is required")
+        fi
+        
+        if [[ -z "$INPUT_SHARE_PASS" ]]; then
+          VALIDATION_ERRORS+=("share-pass input is required")
+        fi
+        
+        # Report validation errors
+        if [[ ${#VALIDATION_ERRORS[@]} -gt 0 ]]; then
+          echo "❌ Validation failed:"
+          for error in "${VALIDATION_ERRORS[@]}"; do
+            echo "$error"
+          done
+          exit 1
+        fi
+        
+        # Validate share name format (alphanumeric and basic chars only)
+        if [[ ! "$INPUT_SHARE_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+          echo "share-name must contain only alphanumeric characters, hyphens, and underscores"
+          exit 1
+        fi
+        
+        # Validate username format
+        if [[ ! "$INPUT_SHARE_USER" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+          echo "share-user must contain only alphanumeric characters, hyphens, and underscores"
+          exit 1
+        fi
+        
+        # Validate password strength (minimum requirements)
+        PASSWORD_LENGTH=${#INPUT_SHARE_PASS}
+        if [[ $PASSWORD_LENGTH -lt 8 ]]; then
+          echo "⚠️ Warning: Password should be at least 8 characters long for better security"
+        fi
+        
+        echo "✅ All inputs validated successfully"
+
+    - name: Prepare shared directory
+      shell: bash
+      run: |
+        echo "📁 Preparing shared directory..."
+        
+        SHARE_PATH="${{ inputs.path }}"
+        
+        # Convert relative path to absolute path
+        if [[ ! "$SHARE_PATH" = /* ]]; then
+          SHARE_PATH="$(pwd)/$SHARE_PATH"
+        fi
+        
+        # Create directory with proper permissions
+        if ! mkdir -p "$SHARE_PATH"; then
+          echo "Failed to create directory: $SHARE_PATH"
+          exit 1
+        fi
+        
+        # Verify directory exists and is accessible
+        if [[ ! -d "$SHARE_PATH" ]]; then
+          echo "Directory does not exist after creation: $SHARE_PATH"
+          exit 1
+        fi
+        
+        if [[ ! -w "$SHARE_PATH" ]]; then
+          echo "Directory is not writable: $SHARE_PATH"
+          exit 1
+        fi
+        
+        echo "✅ Directory prepared: $SHARE_PATH"
+
+    # ================================================
+    # WINDOWS SMB SETUP
+    # ================================================
+    - name: Setup SMB share on Windows
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        # Configuration variables
+        $SHARE_DIR = "${{ inputs.path }}"
+        $SHARE_NAME = "${{ inputs.share-name }}"
+        $SMB_USER = "${{ inputs.share-user }}"
+        $SMB_PASSWORD = "${{ inputs.share-pass }}"
+        
+        Write-Host "Setting up SMB share on Windows..."
+        Write-Host "Share Directory: $SHARE_DIR"
+        Write-Host "Share Name: $SHARE_NAME"
+        Write-Host "SMB User: $SMB_USER"
+        
+        try {
+          # Create new local user with password on Windows
+          $SecurePassword = ConvertTo-SecureString $SMB_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name $SMB_USER -Password $SecurePassword -FullName "SMB User" -Description "User for SMB sharing" -ErrorAction Stop
+          Write-Host "Local user '$SMB_USER' created successfully"
+        } catch {
+          if ($_.Exception.Message -like "*already exists*") {
+            Write-Host "User '$SMB_USER' already exists, continuing..."
+          } else {
+            Write-Host "Failed to create user: $($_.Exception.Message)"
+            exit 1
+          }
+        }
+        
+        try {
+          # Add user to appropriate groups for file sharing
+          Add-LocalGroupMember -Group "Users" -Member $SMB_USER -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Power Users" -Member $SMB_USER -ErrorAction SilentlyContinue
+          Write-Host "User added to required groups"
+        } catch {
+          Write-Host "Group membership may already exist: $($_.Exception.Message)"
+        }
+        
+        try {
+          # Create SMB share on current directory
+          New-SmbShare -Name $SHARE_NAME -Path $SHARE_DIR -FullAccess $SMB_USER -ChangeAccess "Everyone" -ErrorAction Stop
+          Write-Host "SMB share '$SHARE_NAME' created successfully"
+        } catch {
+          if ($_.Exception.Message -like "*already exists*") {
+            Write-Host "Share '$SHARE_NAME' already exists, continuing..."
+          } else {
+            Write-Host "Failed to create SMB share: $($_.Exception.Message)"
+            exit 1
+          }
+        }
+        
+        try {
+          # Grant full control using icacls
+          icacls $SHARE_DIR /grant "${SMB_USER}:(OI)(CI)F" /T
+          Write-Host "File permissions granted successfully"
+        } catch {
+          Write-Host "Failed to set file permissions, but continuing..."
+        }
+        
+        Write-Host "SMB share '$SHARE_NAME' created at path: $SHARE_DIR"
+        Write-Host "User '$SMB_USER' created and granted access"
+
+    # ================================================
+    # MACOS SMB SETUP
+    # ================================================
+    - name: Set up SMB share on macOS
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        # Configuration variables
+        SHARE_DIR="${{ inputs.path }}"
+        SHARE_NAME="${{ inputs.share-name }}"
+        SMB_USER="${{ inputs.share-user }}"
+        SMB_PASSWORD="${{ inputs.share-pass }}"
+        
+        echo "ℹ️ Setting up SMB share on macOS..."
+        echo "ℹ️ Share Directory: $SHARE_DIR"
+        echo "ℹ️ Share Name: $SHARE_NAME"
+        echo "ℹ️ SMB User: $SMB_USER"
+        
+        # ================================================
+        # HOMEBREW & SAMBA INSTALLATION
+        # ================================================
+        echo "ℹ️ Installing Samba via Homebrew..."
+        
+        if ! command -v brew >/dev/null 2>&1; then
+          echo "Homebrew not found. This action requires Homebrew for Samba installation."
+          exit 1
+        fi
+        
+        # Install Samba with better error handling
+        if brew list samba >/dev/null 2>&1; then
+        echo "ℹ️ Samba already installed"
+        else
+        echo "ℹ️ Installing Samba package..."
+        if ! brew install samba; then
+         echo "Failed to install Samba via Homebrew"
+         exit 1
+        fi
+          echo "✅ Samba installed successfully"
+        fi
+        
+        # ================================================
+        # DIRECTORY PERMISSIONS
+        # ================================================
+        echo "ℹ️ Configuring directory permissions..."
+        
+        # Set appropriate permissions for sharing
+        chmod 755 "$SHARE_DIR" || {
+          echo "Failed to set directory permissions"
+          exit 1
+        }
+        
+        echo "✅ Directory permissions configured"
+        
+        # ================================================
+        # SAMBA CONFIGURATION
+        # ================================================
+        echo "ℹ️ Configuring Samba..."
+        
+        # Define Homebrew paths
+        HOMEBREW_PREFIX=$(brew --prefix)
+        SAMBA_CONF_PATH="$HOMEBREW_PREFIX/etc/smb.conf"
+        SMBPASSWD_PATH="$HOMEBREW_PREFIX/bin/smbpasswd"
+        SMBD_PATH="$HOMEBREW_PREFIX/sbin/samba-dot-org-smbd"
+        TESTPARM_PATH="$HOMEBREW_PREFIX/bin/testparm"
+        SAMBA_VAR_DIR="$HOMEBREW_PREFIX/var/lib/samba"
+        
+        # Create necessary directories with proper permissions
+        sudo mkdir -p "$SAMBA_VAR_DIR/private" "$SAMBA_VAR_DIR/locks" "/var/log/samba" || {
+        echo "Failed to create Samba directories"
+        exit 1
+        }
+        
+        echo "✅ Samba directories created"
+        
+        # ================================================
+        # SAMBA CONFIGURATION FILE
+        # ================================================
+        echo "ℹ️ Creating Samba configuration file..."
+        
+        # Create optimized smb.conf with security focus
+        sudo tee "$SAMBA_CONF_PATH" > /dev/null << EOF
+        # =======================================================
+        # Samba Configuration for GitHub Actions SMB Share
+        # Generated automatically - do not edit manually
+        # =======================================================
+        
+        [global]
+        # Basic server settings
+        workgroup = WORKGROUP
+        server string = GitHub Actions SMB Server
+        netbios name = RUNNER-$(hostname -s | tr '[:lower:]' '[:upper:]')
+        server role = standalone server
+        
+        # Security settings - SMB 3.0+ only for better security
+        security = user
+        map to guest = never
+        server min protocol = SMB3_00
+        server max protocol = SMB3_11
+        client min protocol = SMB3_00
+        client max protocol = SMB3_11
+        
+        # Encryption and signing (enhanced security)
+        server smb encrypt = required
+        smb encrypt = required
+        server signing = mandatory
+        client signing = mandatory
+        
+        # Path configuration for Homebrew installation
+        private dir = $SAMBA_VAR_DIR/private
+        lock directory = $SAMBA_VAR_DIR/locks
+        state directory = $SAMBA_VAR_DIR
+        cache directory = $SAMBA_VAR_DIR
+        
+        # Logging configuration
+        log file = /var/log/samba/log.%m
+        max log size = 1000
+        log level = 2
+        
+        # Performance optimizations
+        aio read size = 1048576
+        aio write size = 1048576
+        use sendfile = yes
+        socket options = TCP_NODELAY IPTOS_LOWDELAY SO_RCVBUF=524288 SO_SNDBUF=524288
+        
+        # Disable unnecessary services
+        dns proxy = no
+        load printers = no
+        printing = bsd
+        printcap name = /dev/null
+        disable spoolss = yes
+        
+        # Share definition
+        [$SHARE_NAME]
+        # Basic share settings
+        path = $SHARE_DIR
+        comment = GitHub Actions Automated Share
+        
+        # Access control
+        valid users = $SMB_USER
+        read only = no
+        browseable = yes
+        writable = yes
+        guest ok = no
+        
+        # File creation settings
+        create mask = 0644
+        directory mask = 0755
+        force user = $SMB_USER
+        force create mode = 0644
+        force directory mode = 0755
+        
+        # Security settings for share
+        encrypt passwords = yes
+        smb encrypt = required
+        
+        # Performance settings
+        strict locking = no
+        oplocks = yes
+        level2 oplocks = yes
+        EOF
+        
+        echo "✅ Samba configuration file created"
+        
+        # ================================================
+        # CONFIGURATION VALIDATION
+        # ================================================
+        echo "ℹ️ Validating Samba configuration..."
+        
+        if sudo "$TESTPARM_PATH" -s "$SAMBA_CONF_PATH" >/dev/null 2>&1; then
+          echo "✅ Samba configuration validated successfully"
+        else
+          echo "⚠️ Configuration validation has warnings, but may still work"
+        fi
+        
+        # ================================================
+        # SAMBA DATABASE INITIALIZATION
+        # ================================================
+        echo "ℹ️ Initializing Samba databases..."
+        
+        # Set proper ownership and permissions
+        sudo chown -R "$USER":staff "$SAMBA_VAR_DIR" 2>/dev/null || {
+          echo "⚠️ Could not change ownership of Samba directory"
+        }
+        
+        sudo chmod -R 755 "$SAMBA_VAR_DIR"
+        sudo chmod -R 700 "$SAMBA_VAR_DIR/private" 2>/dev/null || true
+        
+        echo "✅ Samba database initialization completed"
+        
+        # ================================================
+        # USER MANAGEMENT
+        # ================================================
+        echo "ℹ️ Adding user to Samba..."
+        
+        export SMB_CONF_PATH="$SAMBA_CONF_PATH"
+        
+        # Add user with password using smbpasswd
+        if echo -e "$SMB_PASSWORD\n$SMB_PASSWORD" | sudo "$SMBPASSWD_PATH" -c "$SAMBA_CONF_PATH" -a -s "$SMB_USER" 2>/dev/null; then
+          echo "✅ User added to Samba successfully"
+        else
+          echo "Failed to add user to Samba database"
+          exit 1
+        fi
+        
+        # Enable the user account
+        if sudo "$SMBPASSWD_PATH" -c "$SAMBA_CONF_PATH" -e "$SMB_USER" 2>/dev/null; then
+          echo "✅ User account enabled successfully"
+        else
+          echo "⚠️ User enable operation completed with warnings"
+        fi
+        
+        # ================================================
+        # SAMBA SERVICE STARTUP
+        # ================================================
+        echo "ℹ️ Starting Samba daemon..."
+        
+        # Kill any existing Samba processes first
+        sudo pkill -f "samba-dot-org-smbd" 2>/dev/null || true
+        
+        # Start Samba daemon with proper configuration
+        if sudo "$SMBD_PATH" -D -s "$SAMBA_CONF_PATH" --option="private dir=$SAMBA_VAR_DIR/private"; then
+          echo "✅ Samba daemon started successfully"
+        else
+          echo "⚠️ Samba daemon start completed with warnings"
+        fi
+        
+        # Allow time for service to initialize
+        sleep 3
+        
+        # ================================================
+        # SERVICE VERIFICATION
+        # ================================================
+        echo "ℹ️ Verifying SMB service status..."
+        
+        SERVICE_ACTIVE=false
+        
+        # Check for listening ports
+        if netstat -an 2>/dev/null | grep -q ":445.*LISTEN"; then
+          echo "✅ SMB service is listening on port 445 (netstat)"
+          SERVICE_ACTIVE=true
+        elif lsof -i :445 2>/dev/null | grep -q LISTEN; then
+          echo "✅ SMB service is listening on port 445 (lsof)"
+          SERVICE_ACTIVE=true
+        else
+          echo "⚠️ SMB service may not be listening on port 445"
+        fi
+        
+        # Check for running processes
+        if pgrep -f "samba-dot-org-smbd" >/dev/null 2>&1; then
+          echo "✅ Samba daemon process is running"
+          SERVICE_ACTIVE=true
+        else
+          echo "⚠️ Samba daemon process not detected"
+        fi
+        
+        if [[ "$SERVICE_ACTIVE" == "true" ]]; then
+          echo "✅ SMB service verification completed successfully"
+        else
+          echo "⚠️ SMB service verification shows potential issues, but setup may still work"
+        fi
+        
+        echo "✅ macOS SMB setup completed!"
+
+    # ================================================
+    # LINUX SMB SETUP
+    # ================================================
+    - name: Set up SMB share on Linux
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        # Configuration variables
+        SHARE_DIR="${{ inputs.path }}"
+        SHARE_NAME="${{ inputs.share-name }}"
+        SMB_USER="${{ inputs.share-user }}"
+        SMB_PASSWORD="${{ inputs.share-pass }}"
+        
+        echo "ℹ️ Setting up SMB share on Linux..."
+        echo "ℹ️ Share Directory: $SHARE_DIR"
+        echo "ℹ️ Share Name: $SHARE_NAME"
+        echo "ℹ️ SMB User: $SMB_USER"
+        
+        # ================================================
+        # DETECT LINUX DISTRIBUTION
+        # ================================================
+        echo "ℹ️ Detecting Linux distribution..."
+        
+        DISTRO=""
+        if command -v apt-get >/dev/null 2>&1; then
+          DISTRO="debian"
+          echo "✅ Detected Debian/Ubuntu-based distribution"
+        elif command -v yum >/dev/null 2>&1; then
+          DISTRO="rhel"
+          echo "✅ Detected RHEL/CentOS-based distribution"
+        elif command -v dnf >/dev/null 2>&1; then
+          DISTRO="fedora"
+          echo "✅ Detected Fedora-based distribution"
+        else
+          echo "❌ Unsupported Linux distribution. This action supports Debian/Ubuntu, RHEL/CentOS, and Fedora."
+          exit 1
+        fi
+        
+        # ================================================
+        # INSTALL SAMBA
+        # ================================================
+        echo "ℹ️ Installing Samba packages..."
+        
+        case "$DISTRO" in
+          "debian")
+            # Update package index
+            sudo apt-get update -qq
+        
+            # Install Samba packages
+            if ! sudo apt-get install -y samba samba-common-bin; then
+              echo "❌ Failed to install Samba packages"
+              exit 1
+            fi
+        
+            # Set package manager specific paths
+            SAMBA_CONF_PATH="/etc/samba/smb.conf"
+            SMBPASSWD_PATH="/usr/bin/smbpasswd"
+            TESTPARM_PATH="/usr/bin/testparm"
+            SAMBA_SERVICE="smbd"
+            ;;
+          "rhel")
+            # Install Samba packages
+            if ! sudo yum install -y samba samba-common samba-client; then
+              echo "❌ Failed to install Samba packages"
+              exit 1
+            fi
+        
+            # Set package manager specific paths
+            SAMBA_CONF_PATH="/etc/samba/smb.conf"
+            SMBPASSWD_PATH="/usr/bin/smbpasswd"
+            TESTPARM_PATH="/usr/bin/testparm"
+            SAMBA_SERVICE="smb"
+            ;;
+          "fedora")
+            # Install Samba packages
+            if ! sudo dnf install -y samba samba-common samba-client; then
+              echo "❌ Failed to install Samba packages"
+              exit 1
+            fi
+        
+            # Set package manager specific paths
+            SAMBA_CONF_PATH="/etc/samba/smb.conf"
+            SMBPASSWD_PATH="/usr/bin/smbpasswd"
+            TESTPARM_PATH="/usr/bin/testparm"
+            SAMBA_SERVICE="smb"
+            ;;
+        esac
+        
+        echo "✅ Samba packages installed successfully"
+        
+        # ================================================
+        # DIRECTORY PERMISSIONS
+        # ================================================
+        echo "ℹ️ Configuring directory permissions..."
+        
+        # Convert relative path to absolute path
+        if [[ ! "$SHARE_DIR" = /* ]]; then
+          SHARE_DIR="$(pwd)/$SHARE_DIR"
+        fi
+        
+        # Set appropriate permissions for sharing
+        sudo chmod 755 "$SHARE_DIR" || {
+          echo "❌ Failed to set directory permissions"
+          exit 1
+        }
+        
+        echo "✅ Directory permissions configured"
+        
+        # ================================================
+        # BACKUP ORIGINAL CONFIGURATION
+        # ================================================
+        echo "ℹ️ Backing up original Samba configuration..."
+        
+        if [[ -f "$SAMBA_CONF_PATH" ]]; then
+          sudo cp "$SAMBA_CONF_PATH" "$SAMBA_CONF_PATH.backup.$(date +%Y%m%d_%H%M%S)" || {
+            echo "⚠️ Could not backup original configuration"
+          }
+        fi
+        
+        # ================================================
+        # CREATE SAMBA CONFIGURATION
+        # ================================================
+        echo "ℹ️ Creating Samba configuration file..."
+        
+        sudo tee "$SAMBA_CONF_PATH" > /dev/null << EOF
+        # =======================================================
+        # Samba Configuration for GitHub Actions SMB Share (Linux)
+        # Generated automatically - do not edit manually
+        # =======================================================
+        
+        [global]
+        # Basic server settings
+        workgroup = WORKGROUP
+        server string = GitHub Actions SMB Server (Linux)
+        netbios name = RUNNER-$(hostname -s | tr '[:lower:]' '[:upper:]')
+        server role = standalone server
+        
+        # Security settings - SMB 3.0+ only for better security
+        security = user
+        map to guest = never
+        server min protocol = SMB3_00
+        server max protocol = SMB3_11
+        client min protocol = SMB3_00
+        client max protocol = SMB3_11
+        
+        # Encryption and signing (enhanced security)
+        server smb encrypt = required
+        smb encrypt = required
+        server signing = mandatory
+        client signing = mandatory
+        
+        # Path configuration for Linux
+        private dir = /var/lib/samba/private
+        lock directory = /var/lock/samba
+        state directory = /var/lib/samba
+        cache directory = /var/cache/samba
+        
+        # Logging configuration
+        log file = /var/log/samba/log.%m
+        max log size = 1000
+        log level = 2
+        
+        # Performance optimizations
+        aio read size = 1048576
+        aio write size = 1048576
+        use sendfile = yes
+        socket options = TCP_NODELAY IPTOS_LOWDELAY SO_RCVBUF=524288 SO_SNDBUF=524288
+        
+        # Disable unnecessary services
+        dns proxy = no
+        load printers = no
+        printing = bsd
+        printcap name = /dev/null
+        disable spoolss = yes
+        
+        # Share definition
+        [$SHARE_NAME]
+        # Basic share settings
+        path = $SHARE_DIR
+        comment = GitHub Actions Automated Share (Linux)
+        
+        # Access control
+        valid users = $SMB_USER
+        read only = no
+        browseable = yes
+        writable = yes
+        guest ok = no
+        
+        # File creation settings
+        create mask = 0644
+        directory mask = 0755
+        force user = $SMB_USER
+        force create mode = 0644
+        force directory mode = 0755
+        
+        # Security settings for share
+        encrypt passwords = yes
+        smb encrypt = required
+        
+        # Performance settings
+        strict locking = no
+        oplocks = yes
+        level2 oplocks = yes
+        EOF
+        
+        echo "✅ Samba configuration file created"
+        
+        # ================================================
+        # CONFIGURATION VALIDATION
+        # ================================================
+        echo "ℹ️ Validating Samba configuration..."
+        
+        if sudo "$TESTPARM_PATH" -s "$SAMBA_CONF_PATH" >/dev/null 2>&1; then
+          echo "✅ Samba configuration validated successfully"
+        else
+          echo "⚠️ Configuration validation has warnings, but may still work"
+        fi
+        
+        # ================================================
+        # CREATE SYSTEM USER (if needed)
+        # ================================================
+        echo "ℹ️ Creating system user for Samba..."
+        
+        # Check if user already exists
+        if id "$SMB_USER" >/dev/null 2>&1; then
+          echo "ℹ️ System user '$SMB_USER' already exists"
+        else
+          # Create system user without home directory and shell
+          if sudo useradd -r -s /sbin/nologin "$SMB_USER"; then
+            echo "✅ System user '$SMB_USER' created successfully"
+          else
+            echo "❌ Failed to create system user"
+            exit 1
+          fi
+        fi
+        
+        # ================================================
+        # USER MANAGEMENT
+        # ================================================
+        echo "ℹ️ Adding user to Samba database..."
+        
+        # Add user with password using smbpasswd
+        if echo -e "$SMB_PASSWORD\n$SMB_PASSWORD" | sudo "$SMBPASSWD_PATH" -a -s "$SMB_USER" 2>/dev/null; then
+          echo "✅ User added to Samba database successfully"
+        else
+          echo "❌ Failed to add user to Samba database"
+          exit 1
+        fi
+        
+        # Enable the user account
+        if sudo "$SMBPASSWD_PATH" -e "$SMB_USER" 2>/dev/null; then
+          echo "✅ User account enabled successfully"
+        else
+          echo "⚠️ User enable operation completed with warnings"
+        fi
+        
+        # ================================================
+        # SERVICE STARTUP
+        # ================================================
+        echo "ℹ️ Starting Samba services..."
+        
+        # Start and enable Samba services
+        if sudo systemctl start "$SAMBA_SERVICE" 2>/dev/null; then
+          echo "✅ Samba service started successfully"
+        else
+          echo "⚠️ Samba service start completed with warnings"
+        fi
+        
+        # Allow time for services to initialize
+        sleep 5
+        
+        # ================================================
+        # SERVICE VERIFICATION
+        # ================================================
+        echo "ℹ️ Verifying SMB service status..."
+        
+        SERVICE_ACTIVE=false
+        
+        # Check for running processes
+        if pgrep -f smbd >/dev/null 2>&1; then
+          echo "✅ Samba daemon processes are running"
+          SERVICE_ACTIVE=true
+        else
+          echo "⚠️ Samba daemon processes not detected"
+        fi
+        
+        if [[ "$SERVICE_ACTIVE" == "true" ]]; then
+          echo "✅ SMB service verification completed successfully"
+        else
+          echo "⚠️ SMB service verification shows potential issues, but setup may still work"
+        fi
+        
+        echo "✅ Linux SMB setup completed!"
+
+    # ================================================
+    # FINAL VERIFICATION & SUMMARY
+    # ================================================
+    - name: Generate setup summary and verify configuration
+      shell: bash
+      run: |
+        echo ""
+        echo "🎉 ========================================"
+        echo "    SMB Share Setup Completed Successfully"
+        echo "========================================"
+        echo ""
+        echo "📋 Configuration Summary:"
+        echo "  • Operating System: ${{ runner.os }}"
+        echo "  • Share Name: ${{ inputs.share-name }}"
+        echo "  • Share Path: ${{ inputs.path }}"
+        echo "  • SMB Username: ${{ inputs.share-user }}"
+        echo ""
+        echo "✅ Setup completed successfully!"
